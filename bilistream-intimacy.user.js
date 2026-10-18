@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩直播亲密度助手
 // @namespace    bilistream.intimacy-helper
-// @version      1.6.0
+// @version      1.6.1
 // @description  支持房间专属表情替代数字弹幕；按粉丝牌任务进度完成弹幕与点赞。
 // @match        https://live.bilibili.com/*
 // @run-at       document-idle
@@ -244,15 +244,30 @@
     el('stop').disabled = !busy;
   }
   function findNative() {
-    const root = document.getElementById('chat-control-panel-vm');
-    const queue = root?.__vue__ ? [root.__vue__] : [];
-    const seen = new Set();
-    while (queue.length) {
-      const vm = queue.shift();
-      if (!vm || seen.has(vm)) continue;
-      seen.add(vm);
-      if (typeof vm.sendDanmaku === 'function' && typeof vm.handleLikeBtnClick === 'function') return { root, vm };
-      queue.push(...(vm.$children || []));
+    const documents = [document], visited = new Set();
+    while (documents.length) {
+      const doc = documents.shift();
+      if (visited.has(doc)) continue;
+      visited.add(doc);
+      const root = doc.getElementById('chat-control-panel-vm');
+      const queue = root?.__vue__ ? [root.__vue__] : [];
+      const seen = new Set();
+      while (queue.length) {
+        const vm = queue.shift();
+        if (!vm || seen.has(vm)) continue;
+        seen.add(vm);
+        if (!vm._isDestroyed && typeof vm.sendDanmaku === 'function' && typeof vm.handleLikeBtnClick === 'function') return { root, vm };
+        queue.push(...(vm.$children || []));
+      }
+      // Event pages embed the actual room at /blanc/<roomId>?liteVersion=true.
+      // Inspect the live document afresh, including frames that loaded after this script.
+      for (const frame of doc.querySelectorAll('iframe')) {
+        try {
+          const child = frame.contentDocument;
+          const url = child?.defaultView?.location;
+          if (url?.origin === location.origin && /^\/(?:blanc\/)?\d+\/?$/.test(url.pathname)) documents.push(child);
+        } catch { /* Cross-origin and navigating frames are not accessible. */ }
+      }
     }
     throw new Error('未找到支持的直播页内置接口，请等待页面加载或刷新。');
   }
@@ -349,8 +364,9 @@
   }
   // Observe the page's own reporting; never issue or retry a report ourselves.
   function observeReports(task) {
-    const originalFetch = window.fetch;
-    const proto = XMLHttpRequest.prototype;
+    const sourceWindow = task.root.ownerDocument.defaultView;
+    const originalFetch = sourceWindow.fetch;
+    const proto = sourceWindow.XMLHttpRequest.prototype;
     const originalOpen = proto.open, originalSend = proto.send;
     const requests = new WeakMap();
     let active = true;
@@ -367,7 +383,8 @@
         if (!active) return;
         // Current native POSTs use URL parameters; older builds used a form body.
         const params = new URL(url, location.href).searchParams;
-        const bodyParams = value instanceof FormData || value instanceof URLSearchParams ? value : new URLSearchParams(value);
+        const bodyParams = value instanceof FormData || value instanceof URLSearchParams ||
+          value instanceof sourceWindow.FormData || value instanceof sourceWindow.URLSearchParams ? value : new URLSearchParams(value);
         for (const [key, entry] of bodyParams) params.set(key, entry);
         if (!params.has('room_id')) throw new Error('点赞上报缺少房间号，格式可能已变化。');
         if (String(params.get('room_id')) !== task.roomId) { ignored = true; return; }
@@ -396,7 +413,7 @@
       };
     }
     function wrappedFetch(input, init) {
-      const url = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+      const url = typeof input === 'string' || input instanceof URL || input instanceof sourceWindow.URL ? String(input) : input.url;
       const method = init?.method || input?.method || 'GET';
       if (!active || !relevant(url, method)) return originalFetch.apply(this, arguments);
       let body;
@@ -427,11 +444,13 @@
       }
       return originalSend.apply(this, arguments);
     }
-    if (typeof originalFetch === 'function') window.fetch = wrappedFetch;
+    if (typeof originalFetch === 'function') sourceWindow.fetch = wrappedFetch;
     proto.open = wrappedOpen; proto.send = wrappedSend;
     return () => {
       active = false;
-      if (window.fetch === wrappedFetch) window.fetch = originalFetch;
+      try {
+        if (sourceWindow.fetch === wrappedFetch) sourceWindow.fetch = originalFetch;
+      } catch { /* The live iframe may have navigated cross-origin during this task. */ }
       if (proto.open === wrappedOpen) proto.open = originalOpen;
       if (proto.send === wrappedSend) proto.send = originalSend;
     };
@@ -842,9 +861,8 @@
       needsReload = task.pendingRequest || task.sendPending || task.nativePending || task.inflight > 0 || task.likes > task.reported;
       status(`${error.message || '任务出错，已停止。'}${needsReload ? ' 存在未确认操作，请刷新后再开始。' : ''}`);
     } finally {
-      cleanup();
-      job = null;
-      setBusy(false);
+      try { cleanup(); }
+      finally { job = null; setBusy(false); }
     }
   }
   el('start').addEventListener('click', () => { void start('all'); });

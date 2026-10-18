@@ -26,6 +26,30 @@ const path = require('node:path');
       }, options);
       await page.addScriptTag({ path: path.join(__dirname, '../bilistream-intimacy.user.js') });
     }
+    async function mountEmbedded() {
+      await mount({});
+      await page.evaluate(() => {
+        document.getElementById('chat-control-panel-vm').remove();
+        window.shellFetch = window.fetch;
+        const frame = document.createElement('iframe');
+        frame.src = '/blanc/999?liteVersion=true';
+        document.body.appendChild(frame);
+      });
+      const liveFrame = page.frames().find(frame => frame.url().includes('/blanc/999')) ||
+        await page.waitForEvent('framenavigated', { predicate: frame => frame.url().includes('/blanc/999') });
+      await liveFrame.waitForSelector('#chat-control-panel-vm');
+      await liveFrame.addScriptTag({ path: path.join(__dirname, 'native-fixture.cjs') });
+      await liveFrame.evaluate(() => {
+        // The late-created frame fixture must share the shell's controlled clock.
+        window.setTimeout = (...args) => top.setTimeout(...args);
+        window.clearTimeout = (...args) => top.clearTimeout(...args);
+        window.Date = top.Date;
+        window.fixture = window.installNativeFixture(window, { useXHR: true, reportInQuery: true });
+        window.originalXhrOpen = XMLHttpRequest.prototype.open;
+        window.originalXhrSend = XMLHttpRequest.prototype.send;
+      });
+      return liveFrame;
+    }
     await mount({});
     // Exercise the whole native flow with the Page Visibility API reporting hidden.
     // This does not emulate the browser's own timer throttling or tab freezing.
@@ -70,6 +94,29 @@ const path = require('node:path');
     await page.waitForFunction(() => Number(document.getElementById('bilistream-helper').shadowRoot.getElementById('reported-count').textContent) >= 15);
     await page.getByRole('button', { name: '停止', exact: true }).click();
     await page.clock.runFor(100);
+    // An event shell owns the helper, while the embedded live page owns the native transport.
+    const liveFrame = await mountEmbedded();
+    await page.getByRole('button', { name: '开始全部', exact: true }).click();
+    await page.clock.runFor(17000);
+    const embedded = await liveFrame.evaluate(() => ({ messages: fixture.messages, likes: fixture.likes.length, events: fixture.domEvents,
+      reports: fixture.reports, pending: fixture.vm.localSingleReportIntervalLikeNum }));
+    const embeddedStatus = await page.locator('#status').textContent();
+    assert.ok(embedded.messages.length >= 2, JSON.stringify({ ...embedded, status: embeddedStatus }));
+    assert.equal(embedded.messages[1].likesBefore, 30);
+    assert.deepEqual(embedded.events, []);
+    assert.ok(await page.locator('#reported-count').evaluate(node => Number(node.textContent)) >= 30);
+    assert.equal(await page.evaluate(() => window.fetch === window.shellFetch && fixture.likes.length === 0), true);
+    await page.getByRole('button', { name: '停止', exact: true }).click();
+    await page.clock.runFor(100);
+    assert.equal(await liveFrame.evaluate(() => XMLHttpRequest.prototype.open === originalXhrOpen && XMLHttpRequest.prototype.send === originalXhrSend), true);
+    const leavingFrame = await mountEmbedded();
+    await page.getByRole('button', { name: '只点赞', exact: true }).click();
+    await page.clock.runFor(500);
+    await leavingFrame.goto('https://example.org/foreign', { waitUntil: 'domcontentloaded' });
+    await page.getByRole('button', { name: '停止', exact: true }).click();
+    await page.clock.runFor(100);
+    assert.equal(await page.getByRole('button', { name: '开始全部', exact: true }).isDisabled(), false);
+    assert.equal(await page.getByRole('button', { name: '停止', exact: true }).isDisabled(), true);
     await mount({});
     await page.evaluate(() => {
       document.cookie = 'bili_jct=mock-csrf';
@@ -154,6 +201,6 @@ const path = require('node:path');
     assert.equal(await page.locator('#bilistream-helper section').evaluate(node => getComputedStyle(node).backgroundColor), 'rgb(32, 33, 39)');
     await page.locator('#bilistream-helper').screenshot({ path: path.join(__dirname, '../docs/chatterbox-dark-preview.png') });
     assert.deepEqual(errors, []);
-    console.log('Edge passed: native 10 x 30 tasks, emoji tab sending, cross-tab stopping, medal folding, pointer resize, persisted tab/width, mobile layout and host dark theme.');
+    console.log('Edge passed: native 10 x 30 tasks, embedded live frame with XHR reports and cleanup, emoji tab sending, cross-tab stopping, medal folding, pointer resize, persisted tab/width, mobile layout and host dark theme.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
